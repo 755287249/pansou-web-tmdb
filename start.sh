@@ -8,6 +8,17 @@ export DOMAIN=${DOMAIN:-localhost}
 export CACHE_PATH=${CACHE_PATH:-/app/data/cache}
 export LOG_PATH=${LOG_PATH:-/app/data/logs}
 export TMDB_BEARER_TOKEN=${TMDB_BEARER_TOKEN:-}
+export TMDB_API_HOST=${TMDB_API_HOST:-api.themoviedb.org}
+export TMDB_HOST_IP=${TMDB_HOST_IP:-}
+
+# 代理兼容：部分后端/电报请求只读取 HTTP_PROXY / HTTPS_PROXY / ALL_PROXY。
+# 如果用户只配置了 PROXY，这里自动补齐常见变量。
+if [ -n "${PROXY:-}" ]; then
+    export HTTP_PROXY=${HTTP_PROXY:-${PROXY}}
+    export HTTPS_PROXY=${HTTPS_PROXY:-${PROXY}}
+    export ALL_PROXY=${ALL_PROXY:-${PROXY}}
+fi
+export NO_PROXY=${NO_PROXY:-localhost,127.0.0.1,::1,host.docker.internal}
 
 # 健康检查配置
 export HEALTH_CHECK_INTERVAL=${HEALTH_CHECK_INTERVAL:-30}
@@ -24,6 +35,8 @@ echo "- 前端目录: /app/frontend/dist"
 echo "- 缓存目录: ${CACHE_PATH}"
 echo "- 日志目录: ${LOG_PATH}"
 echo "- TMDB代理: $([ -n "${TMDB_BEARER_TOKEN}" ] && echo 已配置 || echo 未配置)"
+echo "- TMDB API Host: ${TMDB_API_HOST}"
+echo "- 网络代理: $([ -n "${HTTP_PROXY:-}" ] && echo 已配置 || echo 未配置)"
 echo "- 健康检查间隔: ${HEALTH_CHECK_INTERVAL}秒"
 echo "========================================"
 
@@ -36,6 +49,54 @@ mkdir -p /app/data/ssl
 # 为nginx日志创建软链接（nginx默认在/var/log/nginx写日志）
 rm -rf /var/log/nginx
 ln -sf /app/data/logs/nginx /var/log/nginx
+
+# 自动选择一个可用的 TMDB 上游 IP，规避部分 NAS/DNS 环境把 TMDB 域名解析到不可达地址。
+# 逻辑：优先使用 TMDB_HOST_IP，其次使用当前 DNS 解析结果，最后使用已验证过的兜底 IP。
+# 选中后写入 /etc/hosts，让 Nginx 反代和容器内 curl/wget 都使用同一个可用上游。
+prepare_tmdb_hosts() {
+    if [ -z "${TMDB_BEARER_TOKEN}" ]; then
+        echo "○ 未配置 TMDB_BEARER_TOKEN，跳过 TMDB 上游探测"
+        return 0
+    fi
+
+    local candidates=""
+    if [ -n "${TMDB_HOST_IP}" ]; then
+        candidates="${candidates} ${TMDB_HOST_IP}"
+    fi
+
+    if command -v getent >/dev/null 2>&1; then
+        local resolved
+        resolved=$(getent ahostsv4 "${TMDB_API_HOST}" 2>/dev/null | awk '{print $1}' | sort -u | tr '\n' ' ' || true)
+        candidates="${candidates} ${resolved}"
+    fi
+
+    # 兜底 IP：来自当前环境中已验证可用的 CloudFront 节点。失效时可以通过环境变量 TMDB_HOST_IP 覆盖。
+    candidates="${candidates} 65.9.175.66"
+
+    local selected=""
+    for ip in ${candidates}; do
+        [ -z "${ip}" ] && continue
+        if curl -fsS --connect-timeout 6 --max-time 12 \
+            --resolve "${TMDB_API_HOST}:443:${ip}" \
+            -H "Authorization: Bearer ${TMDB_BEARER_TOKEN}" \
+            -H "Accept: application/json" \
+            "https://${TMDB_API_HOST}/3/configuration" >/tmp/tmdb-probe.json 2>/dev/null; then
+            selected="${ip}"
+            break
+        fi
+    done
+
+    if [ -n "${selected}" ]; then
+        sed -i "/[[:space:]]${TMDB_API_HOST}$/d" /etc/hosts 2>/dev/null || true
+        echo "${selected} ${TMDB_API_HOST}" >> /etc/hosts
+        export TMDB_HOST_IP="${selected}"
+        echo "✓ TMDB上游已固定: ${TMDB_API_HOST} -> ${selected}"
+    else
+        echo "⚠ TMDB上游探测失败，将继续使用系统DNS解析 ${TMDB_API_HOST}"
+    fi
+}
+
+prepare_tmdb_hosts
 
 # 检测SSL证书是否存在
 SSL_AVAILABLE=false
@@ -105,15 +166,21 @@ else
 fi)
 
     # TMDB API代理 - 给海报墙使用，避免在浏览器暴露Token
+    # 注意：标准 Nginx 不会自动使用 HTTP_PROXY/HTTPS_PROXY。
+    # start.sh 会在启动时探测可用 TMDB 上游并写入 /etc/hosts，避免 DNS 污染或不可达 IP。
     location /tmdb-api/ {
-        proxy_pass https://api.themoviedb.org/;
+        proxy_pass https://${TMDB_API_HOST}/;
         proxy_ssl_server_name on;
-        proxy_set_header Host api.themoviedb.org;
+        proxy_ssl_name ${TMDB_API_HOST};
+        proxy_ssl_verify off;
+        proxy_http_version 1.1;
+        proxy_set_header Host ${TMDB_API_HOST};
         proxy_set_header Authorization "Bearer ${TMDB_BEARER_TOKEN}";
         proxy_set_header Accept "application/json";
-        proxy_connect_timeout 10s;
-        proxy_read_timeout 30s;
-        proxy_send_timeout 10s;
+        proxy_set_header Connection "";
+        proxy_connect_timeout 20s;
+        proxy_read_timeout 60s;
+        proxy_send_timeout 20s;
         proxy_buffering off;
     }
 

@@ -36,7 +36,7 @@ export default defineConfig(({ mode }) => {
       port: 3000,
       proxy: {
         '/tmdb-api': {
-          target: 'https://api.themoviedb.org',
+          target: `https://${env.TMDB_API_HOST || 'api.themoviedb.org'}`,
           changeOrigin: true,
           secure: true,
           rewrite: (path) => path.replace(/^\/tmdb-api/, ''),

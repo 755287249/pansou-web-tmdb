@@ -1,17 +1,21 @@
 services:
   pansou:
-    image: ghcr.io/755287249/pansou-web-tmdb:latest
-    container_name: pansou-app-tmdb
+    image: ghcr.io/755287249/pansou-web:latest
+    container_name: pansou-app
     restart: unless-stopped
     ports:
       - "3333:80"
     extra_hosts:
       - "host.docker.internal:host-gateway"
+      # 规避部分 NAS/DNS 环境把 TMDB 解析到不可达地址；可用 TMDB_HOST_IP 覆盖。
+      - "api.themoviedb.org:${TMDB_HOST_IP:-65.9.175.66}"
     environment:
       - DOMAIN=localhost
       - PANSOU_PORT=8888
       - PANSOU_HOST=127.0.0.1
       - TMDB_BEARER_TOKEN=${TMDB_BEARER_TOKEN}
+      - TMDB_API_HOST=api.themoviedb.org
+      - TMDB_HOST_IP=${TMDB_HOST_IP:-65.9.175.66}
       - CACHE_PATH=/app/data/cache
       - LOG_PATH=/app/data/logs
       - CHANNELS=tgsearchers6,Aliyun_4K_Movies,bdbdndn11,yunpanx,bsbdbfjfjff,yp123pan,sbsbsnsqq,yunpanxunlei,tianyifc,BaiduCloudDisk,txtyzy,peccxinpd,gotopan,PanjClub,kkxlzy,baicaoZY,MCPH01,MCPH02,MCPH03,bdwpzhpd,ysxb48,jdjdn1111,yggpan,MCPH086,zaihuayun,Q66Share,ucwpzy,shareAliyun,alyp_1,dianyingshare,Quark_Movies,XiangxiuNBB,ydypzyfx,ucquark,xx123pan,yingshifenxiang123,zyfb123,tyypzhpd,tianyirigeng,cloudtianyi,hdhhd21,Lsp115,oneonefivewpfx,qixingzhenren,taoxgzy,Channel_Shares_115,tyysypzypd,vip115hot,wp123zy,yunpan139,yunpan189,yunpanuc,yydf_hzl,leoziyuan,Q_dongman,yoyokuakeduanju,TG654TG,WFYSFX02,QukanMovie,yeqingjie_GJG666,movielover8888_film3,Baidu_netdisk,D_wusun,FLMdongtianfudi,KaiPanshare,QQZYDAPP,rjyxfx,PikPak_Share_Channel,btzhi,newproductsourcing,cctv1211,duan_ju,QuarkFree,yunpanNB,kkdj001,xxzlzn,pxyunpanxunlei,jxwpzy,kuakedongman,liangxingzhinan,xiangnikanj,solidsexydoll,guoman4K,zdqxm,kduanju,cilidianying,CBduanju,SharePanFilms,dzsgx,BooksRealm,Oscar_4Kmovies,douerpan,baidu_yppan,Q_jilupian,Netdisk_Movies,yunpanquark,ammmziyuan,ciliziyuanku,cili8888,jzmm_123pan,Q_dianying,domgmingapk,dianying4k,q_dianshiju,tgbokee,ucshare,godupan,gokuapan,gimy115,WFYSFX03,peccxin,Movie888035,xlwpzy,zyywpzy,wydwpzy,gimy100,ucshare,gimy115iso
@@ -31,6 +35,7 @@ services:
       - PROXY=http://host.docker.internal:20171
       - HTTP_PROXY=http://host.docker.internal:20171
       - HTTPS_PROXY=http://host.docker.internal:20171
+      - ALL_PROXY=http://host.docker.internal:20171
       - NO_PROXY=localhost,127.0.0.1,::1,host.docker.internal
       - GYING_HASH_SALT=pansou_gying_secret_2025
       - GYING_ENCRYPTION_KEY=0123456789abcdef0123456789abcdef
