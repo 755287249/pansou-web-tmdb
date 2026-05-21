@@ -93,6 +93,8 @@ const resultFilter = ref('');
 const hideSuspectedInvalid = ref(false);
 const lastPayloadPreview = ref<PosterSearchPayloadPreview | null>(null);
 const lastSearchParams = ref<SearchParams | null>(null);
+const lastSearchMode = ref<'configured' | 'full'>('configured');
+const fullSearching = ref(false);
 const activeRequestKey = ref(0);
 const backgroundTimers = ref<number[]>([]);
 
@@ -263,7 +265,14 @@ async function fetchWall(targetPage = 1, append = false) {
 
   try {
     const response = await fetch(buildTmdbUrl(targetPage));
-    const data = await response.json();
+    const text = await response.text();
+    let data: any;
+
+    try {
+      data = JSON.parse(text);
+    } catch {
+      throw new Error(`TMDB 代理返回的不是 JSON：HTTP ${response.status}，内容开头：${text.slice(0, 80)}`);
+    }
 
     if (!response.ok) {
       throw new Error(data?.status_message || data?.message || `TMDB 请求失败：HTTP ${response.status}`);
@@ -289,7 +298,7 @@ async function fetchWall(targetPage = 1, append = false) {
   }
 }
 
-function buildPreviewPayload(item: TmdbItem | null): PosterSearchPayloadPreview {
+function buildPreviewPayload(item: TmdbItem | null, options: { full?: boolean } = {}): PosterSearchPayloadPreview {
   const title = item ? getTitle(item) : '主角';
   const itemYear = (item ? getYear(item) : '') || selectedYear.value;
   const include = Array.from(new Set([itemYear, ...splitWords(includeWords.value)].filter(Boolean)));
@@ -298,8 +307,8 @@ function buildPreviewPayload(item: TmdbItem | null): PosterSearchPayloadPreview 
   return {
     kw: title,
     cloud_types: [...selectedCloudTypes.value],
-    plugins: [...selectedPlugins.value],
-    channels: [...selectedChannels.value],
+    plugins: options.full ? [] : [...selectedPlugins.value],
+    channels: options.full ? [] : [...selectedChannels.value],
     filter: {
       include,
       exclude
@@ -307,16 +316,24 @@ function buildPreviewPayload(item: TmdbItem | null): PosterSearchPayloadPreview 
   };
 }
 
-function buildSearchParams(item: TmdbItem, srcOverride?: 'all' | 'tg' | 'plugin'): SearchParams {
-  const payload = buildPreviewPayload(item);
+function buildSearchParams(
+  item: TmdbItem,
+  srcOverride?: 'all' | 'tg' | 'plugin',
+  options: { full?: boolean } = {}
+): SearchParams {
+  const payload = buildPreviewPayload(item, options);
   const hasChannels = payload.channels.length > 0;
   const hasPlugins = payload.plugins.length > 0;
 
   let src: 'all' | 'tg' | 'plugin' = 'all';
-  if (srcOverride) {
+  if (options.full) {
+    // 全量搜索：不携带 plugins/channels 限制，让后端使用自身完整配置。
+    src = 'all';
+  } else if (srcOverride) {
     src = srcOverride;
   } else if (hasChannels && hasPlugins) {
-    src = 'tg';
+    // 海报墙默认也直接使用 all，避免只触发插件或只触发 TG。
+    src = 'all';
   } else if (hasChannels) {
     src = 'tg';
   } else if (hasPlugins) {
@@ -329,10 +346,10 @@ function buildSearchParams(item: TmdbItem, srcOverride?: 'all' | 'tg' | 'plugin'
     src
   };
 
-  if (payload.channels.length) {
+  if (!options.full && payload.channels.length) {
     (params as any).channels = payload.channels.join(',');
   }
-  if (payload.plugins.length) {
+  if (!options.full && payload.plugins.length) {
     params.plugins = payload.plugins.join(',');
   }
   if (payload.cloud_types.length) {
@@ -380,21 +397,22 @@ function clearBackgroundTimers() {
   backgroundTimers.value = [];
 }
 
-function scheduleBackgroundRefresh(item: TmdbItem) {
+function scheduleBackgroundRefresh(item: TmdbItem, mode: 'configured' | 'full' = 'configured') {
   clearBackgroundTimers();
 
-  if (!selectedPlugins.value.length) {
+  const shouldRefresh = mode === 'full' || selectedPlugins.value.length > 0;
+  if (!shouldRefresh) {
     isActivelySearching.value = false;
     return;
   }
 
   const hasChannels = selectedChannels.value.length > 0;
-  const src: 'all' | 'plugin' = hasChannels ? 'all' : 'plugin';
+  const src: 'all' | 'plugin' = mode === 'full' ? 'all' : (hasChannels ? 'all' : 'plugin');
 
   [2500, 6000].forEach((delay) => {
     const timer = window.setTimeout(async () => {
       try {
-        const params = buildSearchParams(item, src);
+        const params = buildSearchParams(item, src, { full: mode === 'full' });
         const response = await search(params);
         mergeSearchResponse(response);
       } catch (error) {
@@ -409,11 +427,13 @@ function scheduleBackgroundRefresh(item: TmdbItem) {
   });
 }
 
-async function searchFromPoster(item: TmdbItem) {
+async function searchFromPoster(item: TmdbItem, mode: 'configured' | 'full' = 'configured') {
   clearBackgroundTimers();
   selectedItem.value = item;
+  lastSearchMode.value = mode;
   drawerOpen.value = true;
   searching.value = true;
+  fullSearching.value = mode === 'full';
   isActivelySearching.value = true;
   searchError.value = '';
   resultFilter.value = '';
@@ -421,14 +441,16 @@ async function searchFromPoster(item: TmdbItem) {
   resultTotal.value = 0;
 
   try {
-    const params = buildSearchParams(item);
+    const params = buildSearchParams(item, undefined, { full: mode === 'full' });
     lastSearchParams.value = params;
     const response = await search(params);
     mergeSearchResponse(response, true);
     searching.value = false;
-    scheduleBackgroundRefresh(item);
+    fullSearching.value = false;
+    scheduleBackgroundRefresh(item, mode);
   } catch (error) {
     searching.value = false;
+    fullSearching.value = false;
     isActivelySearching.value = false;
     searchError.value = error instanceof Error ? error.message : 'PanSou 搜索失败';
   }
@@ -436,7 +458,12 @@ async function searchFromPoster(item: TmdbItem) {
 
 async function retrySearch() {
   if (!selectedItem.value) return;
-  await searchFromPoster(selectedItem.value);
+  await searchFromPoster(selectedItem.value, lastSearchMode.value);
+}
+
+async function runFullSearch() {
+  if (!selectedItem.value || fullSearching.value) return;
+  await searchFromPoster(selectedItem.value, 'full');
 }
 
 async function copyPayload() {
@@ -451,6 +478,7 @@ function closeDrawer() {
   drawerOpen.value = false;
   clearBackgroundTimers();
   isActivelySearching.value = false;
+  fullSearching.value = false;
 }
 
 let debounceTimer: number | undefined;
@@ -671,10 +699,13 @@ onUnmounted(() => {
               <div>
                 <span>PanSou 搜索结果</span>
                 <h3>{{ getTitle(selectedItem) }}</h3>
-                <p>{{ getYear(selectedItem) || selectedYear }} · {{ resultTotal }} 条结果</p>
+                <p>{{ getYear(selectedItem) || selectedYear }} · {{ resultTotal }} 条结果 · {{ lastSearchMode === 'full' ? '全量搜索' : '配置搜索' }}</p>
               </div>
             </div>
             <div class="result-hero-actions">
+              <button class="result-full-button" :disabled="fullSearching || searching" @click="runFullSearch">
+                {{ fullSearching ? '全量中...' : '全量搜索' }}
+              </button>
               <button @click="copyPayload">复制请求体</button>
               <button @click="retrySearch">重搜</button>
               <button class="result-close" @click="closeDrawer">×</button>
@@ -704,7 +735,7 @@ onUnmounted(() => {
 
               <div v-else-if="searching && !hasResults" class="poster-empty compact">
                 <strong>正在搜索...</strong>
-                <p>正在触发 PanSou API；如果启用了插件，会继续在后台补充结果。</p>
+                <p>正在触发 PanSou API；全量搜索不会携带插件/频道限制，后端会按自身完整配置检索。</p>
               </div>
 
               <ResultTabs
@@ -726,7 +757,8 @@ onUnmounted(() => {
 .poster-wall-page {
   display: flex;
   flex-direction: column;
-  gap: 1.5rem;
+  gap: 1.1rem;
+  margin-top: -0.5rem;
 }
 
 .poster-hero {
@@ -734,7 +766,7 @@ onUnmounted(() => {
   align-items: stretch;
   justify-content: space-between;
   gap: 1rem;
-  padding: 1.5rem;
+  padding: 1.15rem 1.35rem;
   border: 1px solid hsl(var(--border));
   border-radius: 1.5rem;
   background:
@@ -1247,17 +1279,18 @@ onUnmounted(() => {
 }
 
 .result-mask {
-  align-items: flex-end;
+  align-items: center;
   justify-content: center;
+  padding: 1.5rem;
 }
 
 .poster-result-drawer {
-  width: min(1180px, calc(100vw - 1.5rem));
-  max-height: 90vh;
+  width: min(1240px, calc(100vw - 1.5rem));
+  max-height: min(84vh, 860px);
   display: flex;
   flex-direction: column;
   overflow: hidden;
-  border-radius: 1.5rem 1.5rem 0 0;
+  border-radius: 1.5rem;
   background: hsl(var(--background));
   box-shadow: 0 -18px 55px rgba(15, 23, 42, .22);
 }
@@ -1320,6 +1353,16 @@ onUnmounted(() => {
   background: rgba(255,255,255,.12);
   color: white;
   font-weight: 800;
+}
+
+.result-hero-actions button:disabled {
+  cursor: not-allowed;
+  opacity: .55;
+}
+
+.result-hero-actions .result-full-button {
+  background: hsl(var(--primary));
+  color: hsl(var(--primary-foreground));
 }
 
 .result-tools {
@@ -1410,7 +1453,7 @@ onUnmounted(() => {
   .poster-result-drawer {
     width: 100vw;
     max-height: 94vh;
-    border-radius: 1rem 1rem 0 0;
+    border-radius: 1rem;
   }
 
   .result-hero,
